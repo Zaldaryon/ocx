@@ -52,6 +52,17 @@ export interface InstallProfileOptions {
 	quiet?: boolean
 }
 
+export function resolveProfileRegistries(
+	namespace: string,
+	registryUrl: string,
+	profileRegistries: Record<string, RegistryConfig> = {},
+): Record<string, RegistryConfig> {
+	return {
+		[namespace]: { url: registryUrl },
+		...profileRegistries,
+	}
+}
+
 function formatProfileRollbackCleanupWarning(
 	action: string,
 	targetPath: string,
@@ -513,6 +524,7 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 				dep.includes("/") ? dep : `${namespace}/${dep}`,
 			)
 			let profileRegistries: Record<string, RegistryConfig> = {}
+			let dependencyRegistries = resolveProfileRegistries(namespace, registryUrl)
 
 			try {
 				// ========================================================================
@@ -540,12 +552,13 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 					// If parse fails and no registries field, just use empty {} (already initialized)
 				}
 
-				// Create provider with FULL profile registries
-				// Pass all registries from the profile's ocx.jsonc to support transitive dependencies.
-				// The profile's ocx.jsonc should declare all registries needed (including transitive).
+				// Same-registry dependencies inherit the source registry automatically. Explicit
+				// profile declarations remain available for overrides and cross-registry dependencies.
+				dependencyRegistries = resolveProfileRegistries(namespace, registryUrl, profileRegistries)
+
 				const provider: ConfigProvider = {
 					cwd: profileDir,
-					getRegistries: () => profileRegistries,
+					getRegistries: () => dependencyRegistries,
 					getComponentPath: () => "", // Flat install - no .opencode/ prefix
 				}
 
@@ -560,7 +573,7 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 						namespace,
 						component,
 						registryUrl,
-						profileRegistries,
+						profileRegistries: dependencyRegistries,
 					})
 
 					throw withRegistryDiagnostics(error, {

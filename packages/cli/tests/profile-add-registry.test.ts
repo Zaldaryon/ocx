@@ -3,7 +3,10 @@ import { existsSync } from "node:fs"
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { parseSourceOption } from "../src/commands/profile/add"
-import { resolveEmbeddedProfileTarget } from "../src/commands/profile/install-from-registry"
+import {
+	resolveEmbeddedProfileTarget,
+	resolveProfileRegistries,
+} from "../src/commands/profile/install-from-registry"
 import { _clearFetcherCacheForTests } from "../src/registry/fetcher"
 import { validateSafePath } from "../src/schemas/registry"
 import { ValidationError } from "../src/utils/errors"
@@ -104,6 +107,26 @@ describe("Path security", () => {
 			expect(() => validateSafePath("foo/../bar")).not.toThrow()
 			// ./foo/bar normalizes to "foo/bar" which is safe
 			expect(() => validateSafePath("./foo/bar")).not.toThrow()
+		})
+	})
+})
+
+describe("resolveProfileRegistries()", () => {
+	it("adds the source registry when the profile does not declare it", () => {
+		expect(resolveProfileRegistries("demo", "https://registry.example.com")).toEqual({
+			demo: { url: "https://registry.example.com" },
+		})
+	})
+
+	it("preserves explicit profile overrides and cross-registry declarations", () => {
+		expect(
+			resolveProfileRegistries("demo", "https://source.example.com", {
+				demo: { url: "https://override.example.com" },
+				dependency: { url: "https://dependency.example.com" },
+			}),
+		).toEqual({
+			demo: { url: "https://override.example.com" },
+			dependency: { url: "https://dependency.example.com" },
 		})
 	})
 })
@@ -1044,6 +1067,8 @@ describe("ocx profile add --source (registry installation)", () => {
 	})
 
 	afterEach(async () => {
+		registry.clearFileContent()
+		_clearFetcherCacheForTests()
 		if (originalXdgConfigHome === undefined) {
 			delete process.env.XDG_CONFIG_HOME
 		} else {
@@ -1836,7 +1861,7 @@ describe("ocx profile add --source (registry installation)", () => {
 		}
 	})
 
-	it("should install profile dependencies flat (not in .opencode/)", async () => {
+	it("inherits the configured source registry for same-registry profile dependencies", async () => {
 		// Setup global config with registry configured
 		const globalConfigDir = join(testDir, "opencode")
 		const profilesDir = join(globalConfigDir, "profiles")
@@ -1852,6 +1877,12 @@ describe("ocx profile add --source (registry installation)", () => {
 
 		const workDir = join(testDir, "workspace")
 		await mkdir(workDir, { recursive: true })
+		registry.setFileContent(
+			"test-profile-with-deps",
+			"ocx.jsonc",
+			JSON.stringify({ registries: {} }, null, 2),
+		)
+		_clearFetcherCacheForTests()
 
 		// V2: Install profile with dependencies from registry using --source
 		const { exitCode, output } = await runCLI(
