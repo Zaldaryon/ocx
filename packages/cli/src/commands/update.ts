@@ -23,7 +23,7 @@ import { handleError } from "../utils/handle-error"
 import { logger } from "../utils/logger"
 import { resolveTargetPath } from "../utils/paths"
 import { registerPlannedWriteOrThrow } from "../utils/planned-writes"
-import { hashBundle, hashContent } from "../utils/receipt"
+import { checkFileIntegrity, hashBundle, hashContent } from "../utils/receipt"
 import { addCommonOptions, addGlobalOption, addVerboseOption } from "../utils/shared-options"
 import { createSpinner } from "../utils/spinner"
 
@@ -279,8 +279,14 @@ export async function runUpdateCore(
 			const newHash = await hashBundle(files)
 			const newVersion = `sha256:${newHash}` // Use hash as version/revision
 
-			// Compare hashes
-			if (newHash === entry.hash) {
+			// A matching registry hash only proves the source bundle is unchanged.
+			// Verify the installed files too so update can repair local drift.
+			const bundleIsUnchanged = newHash === entry.hash
+			const installedFilesAreIntact = bundleIsUnchanged
+				? (await checkFileIntegrity(provider.cwd, entry)).intact
+				: false
+
+			if (bundleIsUnchanged && installedFilesAreIntact) {
 				results.push({
 					qualifiedName: canonicalId,
 					oldVersion: entry.revision,

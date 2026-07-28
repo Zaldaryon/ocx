@@ -101,6 +101,38 @@ describe("ocx update", () => {
 		expect(pluginEntry?.[1].updatedAt).toBeDefined()
 	})
 
+	it("restores a missing installed file when the registry bundle is unchanged", async () => {
+		testDir = await setupProject("update-missing-file")
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const filePath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const originalContent = await readFile(filePath, "utf-8")
+		await fsRm(filePath)
+		expect(existsSync(filePath)).toBe(false)
+
+		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
+
+		expect(exitCode).toBe(0)
+		expect(output).not.toContain("All components are up to date")
+		expect(existsSync(filePath)).toBe(true)
+		expect(await readFile(filePath, "utf-8")).toBe(originalContent)
+	})
+
+	it("restores a modified installed file when the registry bundle is unchanged", async () => {
+		testDir = await setupProject("update-modified-file")
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const filePath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const originalContent = await readFile(filePath, "utf-8")
+		await writeFile(filePath, "// locally modified")
+
+		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
+
+		expect(exitCode).toBe(0)
+		expect(output).not.toContain("All components are up to date")
+		expect(await readFile(filePath, "utf-8")).toBe(originalContent)
+	})
+
 	// =========================================================================
 	// --all flag tests
 	// =========================================================================
