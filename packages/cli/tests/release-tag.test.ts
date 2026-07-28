@@ -171,6 +171,21 @@ async function createCommit(repo: TestRepo, fileName: string, contents: string):
 	return gitOrThrow(repo.workDir, ["rev-parse", "HEAD"])
 }
 
+async function advanceRemoteMainWithoutMovingHead(repo: TestRepo): Promise<string> {
+	const parentSha = await getHeadSha(repo)
+	const treeSha = await gitOrThrow(repo.workDir, ["rev-parse", "HEAD^{tree}"])
+	const commitSha = await gitOrThrow(repo.workDir, [
+		"commit-tree",
+		treeSha,
+		"-p",
+		parentSha,
+		"-m",
+		"chore: advance remote main",
+	])
+	await gitOrThrow(repo.workDir, ["push", "origin", `${commitSha}:refs/heads/main`])
+	return commitSha
+}
+
 async function installRejectTagHook(repo: TestRepo, tag: string): Promise<string> {
 	const hookPath = join(repo.remoteDir, "hooks", "pre-receive")
 	await writeFile(
@@ -195,6 +210,46 @@ function missingLookup(): Promise<ExactNpmVersionState> {
 	return Promise.resolve({ state: "missing" })
 }
 
+const failClosedGitScenarios: Array<{
+	name: string
+	intercept: (args: string[]) => boolean
+	result: GitResult
+	expectedMessage: string
+}> = [
+	{
+		name: "the remote manifest cannot be read",
+		intercept: (args) => args[0] === "show",
+		result: { exitCode: 1, stdout: "", stderr: "show failed" },
+		expectedMessage:
+			"Could not verify packages/cli/package.json on origin/main; aborting without tag changes.",
+	},
+	{
+		name: "the remote manifest is malformed",
+		intercept: (args) => args[0] === "show",
+		result: { exitCode: 0, stdout: "{not-json", stderr: "" },
+		expectedMessage:
+			"Could not verify packages/cli/package.json on origin/main; aborting without tag changes.",
+	},
+	{
+		name: "working-tree status cannot be inspected",
+		intercept: (args) => args[0] === "status",
+		result: { exitCode: 1, stdout: "", stderr: "status failed" },
+		expectedMessage: "Could not inspect working tree status; aborting without tag changes.",
+	},
+	{
+		name: "the live default-branch lookup fails",
+		intercept: (args) => args[0] === "ls-remote" && args[1] === "--heads",
+		result: { exitCode: 1, stdout: "", stderr: "ls-remote failed" },
+		expectedMessage: "Could not verify current origin/main; aborting without tag changes.",
+	},
+	{
+		name: "the live default branch is missing",
+		intercept: (args) => args[0] === "ls-remote" && args[1] === "--heads",
+		result: { exitCode: 0, stdout: "", stderr: "" },
+		expectedMessage: "Could not verify current origin/main; aborting without tag changes.",
+	},
+]
+
 describe("release-tag helper", () => {
 	it("creates and pushes a fresh tag when npm is missing and no tags exist", async () => {
 		const repo = await setupRepo("1.2.3")
@@ -216,6 +271,83 @@ describe("release-tag helper", () => {
 		expect(await getRemoteTagSha(repo, tag)).toBe(headSha)
 	})
 
+	it("refuses when the working-tree manifest is newer than origin/<defaultBranch>", async () => {
+		const repo = await setupRepo("1.2.3")
+		const tag = "v1.2.4"
+		const packageJsonPath = join(repo.workDir, "packages", "cli", "package.json")
+
+		await writeFile(
+			packageJsonPath,
+			JSON.stringify(
+				{
+					name: "ocx",
+					version: "1.2.4",
+				},
+				null,
+				2,
+			),
+		)
+
+		const result = await executeReleaseTag(
+			{ force: false },
+			{
+				cwd: repo.workDir,
+				lookupNpmVersionState: missingLookup,
+			},
+		)
+
+		expect(result.exitCode).toBe(1)
+		expect(result.message).toBe(
+			"CLI package manifest must match origin/main (origin: ocx@1.2.3, working tree: ocx@1.2.4); aborting without tag changes.",
+		)
+		expect(await getLocalTagSha(repo, tag)).toBeNull()
+		expect(await getRemoteTagSha(repo, tag)).toBeNull()
+	})
+
+	it("refuses when the working tree has unrelated changes", async () => {
+		const repo = await setupRepo("1.2.3")
+		const tag = "v1.2.3"
+
+		await writeFile(join(repo.workDir, "untracked.txt"), "not committed")
+
+		const result = await executeReleaseTag(
+			{ force: false },
+			{
+				cwd: repo.workDir,
+				lookupNpmVersionState: missingLookup,
+			},
+		)
+
+		expect(result.exitCode).toBe(1)
+		expect(result.message).toBe(
+			"Working tree must be clean to create a release tag; aborting without tag changes.",
+		)
+		expect(await getLocalTagSha(repo, tag)).toBeNull()
+		expect(await getRemoteTagSha(repo, tag)).toBeNull()
+	})
+
+	for (const scenario of failClosedGitScenarios) {
+		it(`fails closed when ${scenario.name}`, async () => {
+			const repo = await setupRepo("1.2.3")
+			const tag = "v1.2.3"
+
+			const result = await executeReleaseTag(
+				{ force: false },
+				{
+					cwd: repo.workDir,
+					lookupNpmVersionState: missingLookup,
+					runGit: (args, cwd) =>
+						scenario.intercept(args) ? Promise.resolve(scenario.result) : git(cwd, args),
+				},
+			)
+
+			expect(result.exitCode).toBe(1)
+			expect(result.message).toBe(scenario.expectedMessage)
+			expect(await getLocalTagSha(repo, tag)).toBeNull()
+			expect(await getRemoteTagSha(repo, tag)).toBeNull()
+		})
+	}
+
 	it("keeps local tag after push failure and reports deterministic recovery message", async () => {
 		const repo = await setupRepo("1.2.3")
 		const tag = "v1.2.3"
@@ -232,11 +364,68 @@ describe("release-tag helper", () => {
 
 		expect(result.exitCode).toBe(1)
 		expect(result.message).toBe(
-			"Created local tag v1.2.3 but failed to push to origin; rerun with --force after fixing the push problem.",
+			"Created local tag v1.2.3 but the guarded push failed; inspect origin/main and rerun with --force only if the local tag is still correct.",
 		)
 
 		const headSha = await getHeadSha(repo)
 		expect(await getLocalTagSha(repo, tag)).toBe(headSha)
+		expect(await getRemoteTagSha(repo, tag)).toBeNull()
+	})
+
+	it("refuses when origin/<defaultBranch> advances during npm validation", async () => {
+		const repo = await setupRepo("1.2.3")
+		const tag = "v1.2.3"
+		const originalHead = await getHeadSha(repo)
+		let advancedSha: string | null = null
+
+		const result = await executeReleaseTag(
+			{ force: false },
+			{
+				cwd: repo.workDir,
+				lookupNpmVersionState: async () => {
+					advancedSha = await advanceRemoteMainWithoutMovingHead(repo)
+					return { state: "missing" }
+				},
+			},
+		)
+
+		expect(result.exitCode).toBe(1)
+		expect(result.message).toBe(
+			"origin/main changed during release validation; aborting without tag changes.",
+		)
+		expect(advancedSha).not.toBe(originalHead)
+		expect(await getHeadSha(repo)).toBe(originalHead)
+		expect(await getLocalTagSha(repo, tag)).toBeNull()
+		expect(await getRemoteTagSha(repo, tag)).toBeNull()
+	})
+
+	it("refuses the remote tag when origin/<defaultBranch> moves before the guarded push", async () => {
+		const repo = await setupRepo("1.2.3")
+		const tag = "v1.2.3"
+		const originalHead = await getHeadSha(repo)
+		let advancedSha: string | null = null
+
+		const result = await executeReleaseTag(
+			{ force: false },
+			{
+				cwd: repo.workDir,
+				lookupNpmVersionState: missingLookup,
+				runGit: async (args, cwd) => {
+					if (!advancedSha && args[0] === "push" && args.includes("--atomic")) {
+						advancedSha = await advanceRemoteMainWithoutMovingHead(repo)
+					}
+					return git(cwd, args)
+				},
+			},
+		)
+
+		expect(result.exitCode).toBe(1)
+		expect(result.message).toBe(
+			"Created local tag v1.2.3 but the guarded push failed; inspect origin/main and rerun with --force only if the local tag is still correct.",
+		)
+		expect(advancedSha).not.toBe(originalHead)
+		expect(await getHeadSha(repo)).toBe(originalHead)
+		expect(await getLocalTagSha(repo, tag)).toBe(originalHead)
 		expect(await getRemoteTagSha(repo, tag)).toBeNull()
 	})
 

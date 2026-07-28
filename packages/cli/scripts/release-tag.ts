@@ -4,6 +4,9 @@
  * Safety contract:
  * - Reads version from packages/cli/package.json only
  * - Requires HEAD to exactly match origin/<defaultBranch>
+ * - Requires the working-tree manifest to match origin/<defaultBranch>
+ * - Requires a clean working tree
+ * - Revalidates the live default branch immediately before a guarded tag push
  * - Uses exact npm name@version lookup as source of truth
  * - Never rewrites existing semver tags
  * - `--force` only retries pushing an already-correct local tag
@@ -28,6 +31,9 @@ const USAGE_TEXT = [
 	"",
 	"Safety:",
 	"- Requires HEAD to equal origin/<defaultBranch> after refresh.",
+	"- Requires packages/cli/package.json to match origin/<defaultBranch>.",
+	"- Requires a clean working tree.",
+	"- Revalidates origin/<defaultBranch> immediately before a guarded tag push.",
 	"- Requires exact npm name@version to be definitively missing.",
 	"- Never rewrites semver tags or overrides immutable npm releases.",
 	"",
@@ -131,6 +137,10 @@ async function readCliPackageManifest(
 ): Promise<{ name: string; version: string }> {
 	const packagePath = resolve(repoRoot, "packages", "cli", "package.json")
 	const rawManifest = await readFile(packagePath, "utf-8")
+	return parsePackageManifest(rawManifest)
+}
+
+function parsePackageManifest(rawManifest: string): { name: string; version: string } {
 	const parsed = JSON.parse(rawManifest) as { name?: unknown; version?: unknown }
 
 	if (typeof parsed.name !== "string" || typeof parsed.version !== "string") {
@@ -216,6 +226,42 @@ async function getRemoteTagState(
 	}
 
 	return { sha: parseRemoteTagSha(tag, result.stdout), error: false }
+}
+
+function parseRemoteBranchSha(branch: string, stdout: string): string | null {
+	for (const line of stdout.split("\n")) {
+		const [sha, ref] = line.trim().split(/\s+/, 2)
+		if (sha && ref === `refs/heads/${branch}`) {
+			return sha
+		}
+	}
+
+	return null
+}
+
+async function getRemoteBranchState(
+	runGit: ReleaseTagDependencies["runGit"],
+	cwd: string,
+	branch: string,
+): Promise<TagState> {
+	const result = await runGit(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], cwd)
+
+	if (result.exitCode !== 0) {
+		return { sha: null, error: true }
+	}
+
+	return { sha: parseRemoteBranchSha(branch, result.stdout), error: false }
+}
+
+function getGuardedTagPushArgs(defaultBranch: string, headSha: string, tag: string): string[] {
+	return [
+		"push",
+		"--atomic",
+		`--force-with-lease=refs/heads/${defaultBranch}:${headSha}`,
+		"origin",
+		`${headSha}:refs/heads/${defaultBranch}`,
+		`refs/tags/${tag}`,
+	]
 }
 
 function success(message: string): ReleaseTagExecutionResult {
@@ -323,6 +369,43 @@ export async function executeReleaseTag(
 		)
 	}
 
+	const remoteManifestResult = await deps.runGit(
+		["show", `refs/remotes/origin/${defaultBranch}:packages/cli/package.json`],
+		deps.cwd,
+	)
+	if (remoteManifestResult.exitCode !== 0) {
+		return failure(
+			`Could not verify packages/cli/package.json on origin/${defaultBranch}; aborting without tag changes.`,
+		)
+	}
+
+	let remoteManifest: { name: string; version: string }
+	try {
+		remoteManifest = parsePackageManifest(remoteManifestResult.stdout)
+	} catch {
+		return failure(
+			`Could not verify packages/cli/package.json on origin/${defaultBranch}; aborting without tag changes.`,
+		)
+	}
+
+	if (manifest.name !== remoteManifest.name || manifest.version !== remoteManifest.version) {
+		return failure(
+			`CLI package manifest must match origin/${defaultBranch} ` +
+				`(origin: ${remoteManifest.name}@${remoteManifest.version}, ` +
+				`working tree: ${manifest.name}@${manifest.version}); aborting without tag changes.`,
+		)
+	}
+
+	const statusResult = await deps.runGit(["status", "--porcelain=v1"], deps.cwd)
+	if (statusResult.exitCode !== 0) {
+		return failure("Could not inspect working tree status; aborting without tag changes.")
+	}
+	if (statusResult.stdout) {
+		return failure(
+			"Working tree must be clean to create a release tag; aborting without tag changes.",
+		)
+	}
+
 	const npmState = await ensureMissingNpmVersion(
 		deps.lookupNpmVersionState,
 		manifest.name,
@@ -355,6 +438,18 @@ export async function executeReleaseTag(
 
 	if (remoteTagState.sha) {
 		return failure(getRemoteTagExistsMessage(releaseTag, options.force))
+	}
+
+	const liveDefaultBranchState = await getRemoteBranchState(deps.runGit, deps.cwd, defaultBranch)
+	if (liveDefaultBranchState.error || !liveDefaultBranchState.sha) {
+		return failure(
+			`Could not verify current origin/${defaultBranch}; aborting without tag changes.`,
+		)
+	}
+	if (liveDefaultBranchState.sha !== headSha) {
+		return failure(
+			`origin/${defaultBranch} changed during release validation; aborting without tag changes.`,
+		)
 	}
 
 	if (localTagState.sha) {
@@ -390,12 +485,13 @@ export async function executeReleaseTag(
 		}
 
 		const pushExistingTagResult = await deps.runGit(
-			["push", "origin", `refs/tags/${releaseTag}`],
+			getGuardedTagPushArgs(defaultBranch, headSha, releaseTag),
 			deps.cwd,
 		)
 		if (pushExistingTagResult.exitCode !== 0) {
 			return failure(
-				`Failed to push existing local release tag ${releaseTag}; aborting without tag changes.`,
+				`Guarded push failed for existing local release tag ${releaseTag}; ` +
+					`inspect origin/${defaultBranch} before retrying.`,
 			)
 		}
 
@@ -409,10 +505,18 @@ export async function executeReleaseTag(
 		)
 	}
 
-	const pushTagResult = await deps.runGit(["push", "origin", `refs/tags/${releaseTag}`], deps.cwd)
+	// If push advertisement sees the branch move from headSha, its exact lease
+	// rejects that refspec and --atomic rejects the tag with it. Git may elide
+	// the no-op branch refspec when it is still current, so the live ls-remote
+	// check immediately above remains the primary revalidation.
+	const pushTagResult = await deps.runGit(
+		getGuardedTagPushArgs(defaultBranch, headSha, releaseTag),
+		deps.cwd,
+	)
 	if (pushTagResult.exitCode !== 0) {
 		return failure(
-			`Created local tag ${releaseTag} but failed to push to origin; rerun with --force after fixing the push problem.`,
+			`Created local tag ${releaseTag} but the guarded push failed; ` +
+				`inspect origin/${defaultBranch} and rerun with --force only if the local tag is still correct.`,
 		)
 	}
 
