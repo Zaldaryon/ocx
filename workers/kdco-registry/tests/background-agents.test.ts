@@ -204,9 +204,9 @@ describe("background-agents lifecycle refactor", () => {
 			rootSessionID,
 			childPromptMode: "pending",
 			onParentPrompt: async (text) => {
-				if (!text.includes("<task-id>stable-lifecycle-id</task-id>")) return
+				if (!text.includes("- **Task ID:** `stable-lifecycle-id`")) return
 
-				const artifactPathMatch = text.match(/<artifact>([^<]+)<\/artifact>/)
+				const artifactPathMatch = text.match(/- \*\*Artifact:\*\* `([^`]+)`/)
 				if (!artifactPathMatch) return
 
 				try {
@@ -255,7 +255,7 @@ describe("background-agents lifecycle refactor", () => {
 		expect(completedList.find((item) => item.id === delegation.id)?.status).toBe("complete")
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<task-id>stable-lifecycle-id</task-id>"),
+			text.includes("- **Task ID:** `stable-lifecycle-id`"),
 		)
 		expect(terminalNotifications).toHaveLength(1)
 	})
@@ -276,7 +276,7 @@ describe("background-agents lifecycle refactor", () => {
 			allCompleteQuietPeriodMs: 5,
 			metadataGenerator: async () => ({
 				title: "Queued Result",
-				description: "Direct delivery failed.",
+				description: "## Details\n\n- Direct delivery failed.\n\n<script>alert(1)</script>",
 			}),
 		})
 
@@ -298,8 +298,13 @@ describe("background-agents lifecycle refactor", () => {
 		const output = { parts: [{ type: "text", text: "continue" }] }
 		manager.injectPendingNotificationsIntoChatMessage(output, rootSessionID)
 
-		expect(output.parts[0]?.text).toContain("<task-id>queued-notification-id</task-id>")
-		expect(output.parts[0]?.text).toContain("<summary>All delegations complete.</summary>")
+		expect(output.parts[0]?.text).toContain("### Background agent complete: Queued Result")
+		expect(output.parts[0]?.text).toContain("- **Task ID:** `queued-notification-id`")
+		expect(output.parts[0]?.text).toContain("## Details")
+		expect(output.parts[0]?.text).toContain("&lt;script&gt;alert(1)&lt;/script&gt;")
+		expect(output.parts[0]?.text).not.toContain("<script>")
+		expect(output.parts[0]?.text).toContain("### All delegations complete")
+		expect(output.parts[0]?.text).not.toContain("<task-notification>")
 		expect(output.parts[0]?.text).toContain("continue")
 
 		const secondOutput = { parts: [{ type: "text", text: "next" }] }
@@ -424,23 +429,23 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 30)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<summary>All delegations complete.</summary>"),
+			text.includes("### All delegations complete"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<task-id>"),
+			text.includes("- **Task ID:** `"),
 		)
 		expect(terminalNotifications).toHaveLength(2)
 
 		const parentPromptCalls = state.promptCalls.filter((call) => call.sessionID === rootSessionID)
 		const terminalPromptCalls = parentPromptCalls.filter((call) =>
-			getPromptText(call).includes("<task-id>"),
+			getPromptText(call).includes("- **Task ID:** `"),
 		)
 		expect(terminalPromptCalls).toHaveLength(2)
 		const terminalPromptIndices = parentPromptCalls
 			.map((call, index) => ({ call, index }))
-			.filter(({ call }) => getPromptText(call).includes("<task-id>"))
+			.filter(({ call }) => getPromptText(call).includes("- **Task ID:** `"))
 			.map(({ index }) => index)
 		expect(terminalPromptIndices).toHaveLength(2)
 		for (const call of terminalPromptCalls) {
@@ -448,12 +453,12 @@ describe("background-agents lifecycle refactor", () => {
 		}
 
 		const allCompletePromptCalls = parentPromptCalls.filter((call) =>
-			getPromptText(call).includes("<summary>All delegations complete.</summary>"),
+			getPromptText(call).includes("### All delegations complete"),
 		)
 		expect(allCompletePromptCalls).toHaveLength(1)
 		expect(allCompletePromptCalls[0]?.body.noReply).toBe(false)
 		const allCompletePromptIndex = parentPromptCalls.findIndex((call) =>
-			getPromptText(call).includes("<summary>All delegations complete.</summary>"),
+			getPromptText(call).includes("### All delegations complete"),
 		)
 		expect(allCompletePromptIndex).toBeGreaterThan(Math.max(...terminalPromptIndices))
 	})
@@ -512,14 +517,14 @@ describe("background-agents lifecycle refactor", () => {
 		expect(completedList.find((item) => item.id === second.id)?.status).toBe("complete")
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<task-id>"),
+			text.includes("- **Task ID:** `"),
 		)
 		expect(terminalNotifications).toHaveLength(2)
 		expect(terminalNotifications.some((text) => text.includes(first.id))).toBe(true)
 		expect(terminalNotifications.some((text) => text.includes(second.id))).toBe(true)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<summary>All delegations complete.</summary>"),
+			text.includes("### All delegations complete"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
 	})
@@ -564,7 +569,7 @@ describe("background-agents lifecycle refactor", () => {
 		await manager.handleSessionIdle(batchADelegation.sessionID)
 
 		const allCompleteAfterBatchAFinalize = state.notificationTexts.filter((text) =>
-			text.includes("<summary>All delegations complete.</summary>"),
+			text.includes("### All delegations complete"),
 		)
 		expect(allCompleteAfterBatchAFinalize).toHaveLength(0)
 
@@ -591,7 +596,7 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 40)
 
 		const allCompleteBeforeBatchBFinalize = state.notificationTexts.filter((text) =>
-			text.includes("<summary>All delegations complete.</summary>"),
+			text.includes("### All delegations complete"),
 		)
 		expect(allCompleteBeforeBatchBFinalize).toHaveLength(0)
 
@@ -602,22 +607,22 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 40)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("<summary>All delegations complete.</summary>"),
+			text.includes("### All delegations complete"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
-		expect(allCompleteNotifications[0]).toContain("<cycle>2</cycle>")
+		expect(allCompleteNotifications[0]).toContain("- **Cycle:** 2")
 		expect(allCompleteNotifications[0]).toContain(
-			`<cycle-token>${batchBDelegation.notificationCycleToken}</cycle-token>`,
+			`- **Cycle token:** \`${batchBDelegation.notificationCycleToken}\``,
 		)
 		expect(allCompleteNotifications[0]).not.toContain(
-			`<cycle-token>${batchADelegation.notificationCycleToken}</cycle-token>`,
+			`- **Cycle token:** \`${batchADelegation.notificationCycleToken}\``,
 		)
 
 		const notificationsAfterBatchBStart = state.notificationTexts
 			.slice(notificationCountAtBatchBStart)
-			.filter((text) => text.includes("<summary>All delegations complete.</summary>"))
+			.filter((text) => text.includes("### All delegations complete"))
 		expect(notificationsAfterBatchBStart).toHaveLength(1)
-		expect(notificationsAfterBatchBStart[0]).toContain("<cycle>2</cycle>")
+		expect(notificationsAfterBatchBStart[0]).toContain("- **Cycle:** 2")
 	})
 
 	it("preserves unread carry-forward when delegation_read returns terminal fallback first", async () => {

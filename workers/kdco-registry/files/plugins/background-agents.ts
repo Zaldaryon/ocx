@@ -386,6 +386,18 @@ function normalizeId(value: string): string {
 	return value.trim()
 }
 
+function escapeNotificationText(value: string): string {
+	return value.replace(/\r?\n/g, " ").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+function escapeNotificationCode(value: string): string {
+	return value.replace(/[\\`]/g, "\\$&").replace(/\r?\n/g, " ")
+}
+
+function escapeNotificationMarkdown(value: string): string {
+	return value.replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
 function parsePersistedStatus(raw: string | undefined): DelegationStatus {
 	if (!raw) return "complete"
 	if (raw === "registered") return "registered"
@@ -749,6 +761,7 @@ class DelegationManager {
 			parentAgent,
 			this.buildAllCompleteNotification(parentSessionID, cycle, cycleToken),
 			false,
+			this.buildAllCompleteNotificationDisplay(parentSessionID, cycle, cycleToken),
 		)
 
 		if (state.allCompleteCycleToken !== cycleToken) return
@@ -775,6 +788,7 @@ class DelegationManager {
 		parentAgent: string,
 		notification: string,
 		noReply: boolean,
+		displayText: string = notification,
 	): Promise<"sent" | "queued" | "timed-out"> {
 		const session = this.client.session
 		let timeout: ReturnType<typeof setTimeout> | undefined
@@ -793,7 +807,7 @@ class DelegationManager {
 						body: {
 							noReply,
 							agent: parentAgent,
-							parts: [{ type: "text", text: notification }],
+							parts: [{ type: "text", text: displayText }],
 						},
 					})
 					.then(() => "sent" as const),
@@ -810,7 +824,7 @@ class DelegationManager {
 
 			return result
 		} catch (error) {
-			this.queuePendingNotification(parentSessionID, notification)
+			this.queuePendingNotification(parentSessionID, displayText)
 			await this.debugLog(
 				`parent notification queued for ${parentSessionID}: ${
 					error instanceof Error ? error.message : "Unknown error"
@@ -926,6 +940,36 @@ class DelegationManager {
 		return lines.filter((line) => line.length > 0).join("\n")
 	}
 
+	private buildTerminalNotificationDisplay(
+		delegation: DelegationRecord,
+		remainingCount: number,
+	): string {
+		const title = escapeNotificationText(delegation.title || delegation.id)
+		const lines = [
+			`### Background agent ${escapeNotificationText(delegation.status)}: ${title}`,
+			"",
+			`- **Task ID:** \`${escapeNotificationCode(delegation.id)}\``,
+			`- **Status:** \`${escapeNotificationCode(delegation.status)}\``,
+			`- **Artifact:** \`${escapeNotificationCode(delegation.artifact.filePath)}\``,
+			`- **Retrieve:** \`delegation_read("${escapeNotificationCode(delegation.id)}")\``,
+		]
+
+		if (delegation.description?.trim()) {
+			lines.push(
+				"",
+				"**Description:**",
+				"",
+				escapeNotificationMarkdown(delegation.description.trim()),
+			)
+		}
+		if (delegation.error) {
+			lines.push(`- **Error:** ${escapeNotificationText(delegation.error)}`)
+		}
+		if (remainingCount > 0) lines.push(`- **Remaining:** ${remainingCount}`)
+
+		return lines.join("\n")
+	}
+
 	private buildAllCompleteNotification(
 		parentSessionID: string,
 		cycle: number,
@@ -943,6 +987,20 @@ class DelegationManager {
 			`<cycle>${cycle}</cycle>`,
 			`<cycle-token>${cycleToken}</cycle-token>`,
 			"</task-notification>",
+		].join("\n")
+	}
+
+	private buildAllCompleteNotificationDisplay(
+		parentSessionID: string,
+		cycle: number,
+		cycleToken: string,
+	): string {
+		return [
+			"### All delegations complete",
+			"",
+			`- **Parent session:** \`${escapeNotificationCode(parentSessionID)}\``,
+			`- **Cycle:** ${cycle}`,
+			`- **Cycle token:** \`${escapeNotificationCode(cycleToken)}\``,
 		].join("\n")
 	}
 
@@ -1049,6 +1107,7 @@ class DelegationManager {
 				delegation.parentAgent,
 				terminalNotification,
 				true,
+				this.buildTerminalNotificationDisplay(delegation, remainingCount),
 			)
 
 			this.markNotified(delegation.id)
@@ -1370,7 +1429,7 @@ ${description}
 			return this.buildDeterministicTerminalReadResponse(delegation)
 		}
 
-		return `Delegation "${delegation.id}" is still running. You will receive a <task-notification> when it reaches a terminal state.`
+		return `Delegation "${delegation.id}" is still running. You will receive a rendered background-agent notification when it reaches a terminal state.`
 	}
 
 	/**
@@ -1714,7 +1773,7 @@ Agents route based on their permissions:
 ## Critical Constraints
 
 **NEVER poll \`delegation_list\` to check completion.**
-You WILL be notified via \`<task-notification>\`. Polling wastes tokens.
+You WILL be notified in a rendered background-agent notification. Polling wastes tokens.
 
 **NEVER wait idle.** Always have productive work while delegations run.
 
@@ -1771,7 +1830,7 @@ function formatDelegationContext(
 
 		// Only include reminder when there ARE running delegations
 		sections.push(
-			"> **Note:** You WILL be notified via `<task-notification>` when delegations complete.",
+			"> **Note:** You WILL be notified in a rendered background-agent notification when delegations complete.",
 		)
 		sections.push("> Do NOT poll `delegation_list` - continue productive work.")
 		sections.push("")
