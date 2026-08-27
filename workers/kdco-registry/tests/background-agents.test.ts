@@ -772,3 +772,60 @@ describe("background-agents lifecycle refactor", () => {
 		).rejects.toThrow("read-only")
 	})
 })
+
+describe("notification text escaping", () => {
+	const { escapeNotificationText, markdownCodeSpan } = BackgroundAgentsPlugin.testInternals
+
+	it("escapes Markdown control characters so a generated title cannot restructure the notification", () => {
+		const escaped = escapeNotificationText("[click me](https://evil.example) and **bold**")
+		expect(escaped).not.toContain("[click me](https://evil.example)")
+		expect(escaped).not.toContain("**bold**")
+		expect(escaped).toBe("\\[click me\\]\\(https://evil\\.example\\) and \\*\\*bold\\*\\*")
+	})
+
+	it("still HTML-escapes angle brackets and ampersands in plain text", () => {
+		const escaped = escapeNotificationText("<script>alert(1)</script> & friends")
+		expect(escaped).not.toContain("<script>")
+		expect(escaped).toBe("&lt;script&gt;alert\\(1\\)&lt;/script&gt; &amp; friends")
+	})
+
+	it("collapses newlines to spaces", () => {
+		expect(escapeNotificationText("line one\nline two\r\nline three")).toBe(
+			"line one line two line three",
+		)
+	})
+
+	it("wraps an ordinary value in single backticks", () => {
+		expect(markdownCodeSpan("stable-lifecycle-id")).toBe("`stable-lifecycle-id`")
+	})
+
+	it("widens the fence instead of backslash-escaping a backtick in the value", () => {
+		const span = markdownCodeSpan("a`b")
+		// A single backslash before the backtick would not be literal inside a code
+		// span at all: it would still close the span early. The fence has to widen
+		// past the internal backtick instead, which a 2-backtick fence already does
+		// unambiguously since the lone internal backtick is a run of length 1, not 2.
+		expect(span).toBe("``a`b``")
+	})
+
+	it("widens the fence past the longest run of backticks the value contains", () => {
+		const span = markdownCodeSpan("has ``double`` backticks")
+		expect(span).toBe("```has ``double`` backticks```")
+	})
+
+	it("pads with a space when the value itself starts or ends with a backtick", () => {
+		// Without the padding space, the fence's own backtick would merge with the
+		// value's leading one into a run one longer than the parser is looking for.
+		expect(markdownCodeSpan("`leading")).toBe("`` `leading ``")
+		expect(markdownCodeSpan("trailing`")).toBe("`` trailing` ``")
+	})
+
+	it("does not double backslashes in a Windows-style path", () => {
+		const span = markdownCodeSpan("C:\\Users\\foo\\artifact.txt")
+		expect(span).toBe("`C:\\Users\\foo\\artifact.txt`")
+	})
+
+	it("collapses newlines inside a code span too", () => {
+		expect(markdownCodeSpan("line one\nline two")).toBe("`line one line two`")
+	})
+})

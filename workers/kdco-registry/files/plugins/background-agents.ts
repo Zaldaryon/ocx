@@ -386,12 +386,40 @@ function normalizeId(value: string): string {
 	return value.trim()
 }
 
+/**
+ * Escapes a value destined for plain notification text (title, error): HTML
+ * entities so it can sit inside a Markdown document, then Markdown's own
+ * control characters so a generated title or error message displays as
+ * literal text instead of restructuring the notification (a title of
+ * `[x](evil)` becoming a link, `**y**` becoming bold, and so on). The
+ * `description` field is the one intentional Markdown channel and goes
+ * through {@link escapeNotificationMarkdown} instead, never this function.
+ */
 function escapeNotificationText(value: string): string {
-	return value.replace(/\r?\n/g, " ").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+	return value
+		.replace(/\r?\n/g, " ")
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/[\\`*_[\]{}()#+\-.!|]/g, "\\$&")
 }
 
-function escapeNotificationCode(value: string): string {
-	return value.replace(/[\\`]/g, "\\$&").replace(/\r?\n/g, " ")
+/**
+ * Wraps a value in a Markdown inline code span, escaped the way code spans
+ * actually work: backslashes are not special inside one, so escaping a
+ * backtick with `\` only doubles literal backslashes (breaking Windows
+ * paths) without stopping the backtick from closing the span early. The
+ * correct escape is a fence longer than the longest run of backticks the
+ * value itself contains, padded with a single space on each side when the
+ * value starts or ends with a backtick, so the fence characters never touch
+ * the content's own backticks.
+ */
+function markdownCodeSpan(value: string): string {
+	const collapsed = value.replace(/\r?\n/g, " ")
+	const longestBacktickRun = Math.max(0, ...(collapsed.match(/`+/g) ?? []).map((run) => run.length))
+	const fence = "`".repeat(longestBacktickRun + 1)
+	const needsPadding = collapsed.startsWith("`") || collapsed.endsWith("`")
+	return needsPadding ? `${fence} ${collapsed} ${fence}` : `${fence}${collapsed}${fence}`
 }
 
 function escapeNotificationMarkdown(value: string): string {
@@ -948,10 +976,10 @@ class DelegationManager {
 		const lines = [
 			`### Background agent ${escapeNotificationText(delegation.status)}: ${title}`,
 			"",
-			`- **Task ID:** \`${escapeNotificationCode(delegation.id)}\``,
-			`- **Status:** \`${escapeNotificationCode(delegation.status)}\``,
-			`- **Artifact:** \`${escapeNotificationCode(delegation.artifact.filePath)}\``,
-			`- **Retrieve:** \`delegation_read("${escapeNotificationCode(delegation.id)}")\``,
+			`- **Task ID:** ${markdownCodeSpan(delegation.id)}`,
+			`- **Status:** ${markdownCodeSpan(delegation.status)}`,
+			`- **Artifact:** ${markdownCodeSpan(delegation.artifact.filePath)}`,
+			`- **Retrieve:** ${markdownCodeSpan(`delegation_read("${delegation.id}")`)}`,
 		]
 
 		if (delegation.description?.trim()) {
@@ -998,9 +1026,9 @@ class DelegationManager {
 		return [
 			"### All delegations complete",
 			"",
-			`- **Parent session:** \`${escapeNotificationCode(parentSessionID)}\``,
+			`- **Parent session:** ${markdownCodeSpan(parentSessionID)}`,
 			`- **Cycle:** ${cycle}`,
-			`- **Cycle token:** \`${escapeNotificationCode(cycleToken)}\``,
+			`- **Cycle token:** ${markdownCodeSpan(cycleToken)}`,
 		].join("\n")
 	}
 
@@ -2036,6 +2064,8 @@ const BackgroundAgentsPluginWithInternals = Object.assign(BackgroundAgentsPlugin
 	testInternals: {
 		DelegationManager,
 		formatDelegationContext,
+		escapeNotificationText,
+		markdownCodeSpan,
 	},
 } as const)
 
