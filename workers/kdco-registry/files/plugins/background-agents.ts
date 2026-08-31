@@ -13,7 +13,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
-import type { Event, Message, Part, TextPart } from "@opencode-ai/sdk"
+import type { Event, EventTuiToastShow, Message, Part, TextPart } from "@opencode-ai/sdk"
 import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 import type { OpencodeClient } from "./kdco-primitives/types"
@@ -39,6 +39,8 @@ interface GeneratedMetadata {
 	title: string
 	description: string
 }
+
+type TuiToastOptions = EventTuiToastShow["properties"]
 
 /**
  * Generate title and description from result content using small_model
@@ -401,7 +403,15 @@ function escapeNotificationText(value: string): string {
 		.replace(/&/g, "&amp;")
 		.replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;")
-		.replace(/[\\`*_[\]{}()#+\-.!|]/g, "\\$&")
+		.replace(/[\\`*_[\]{}()#+\-.!|~]/g, "\\$&")
+}
+
+function plainNotificationText(value: string): string {
+	return value.replace(/\r?\n/g, " ").trim()
+}
+
+function escapeNotificationXml(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
 /**
@@ -784,6 +794,8 @@ class DelegationManager {
 		if (!this.areCycleTerminalNotificationsComplete(parentSessionID, cycleToken)) return
 		if (state.allCompleteNotifiedCycleToken === cycleToken) return
 
+		await this.publishTuiToast(this.buildAllCompleteNotificationToast())
+
 		const deliveryStatus = await this.sendParentNotification(
 			parentSessionID,
 			parentAgent,
@@ -835,7 +847,9 @@ class DelegationManager {
 						body: {
 							noReply,
 							agent: parentAgent,
-							parts: [{ type: "text", text: displayText }],
+							// Keep the machine-readable notification in model context without
+							// exposing Markdown as a literal user message in the TUI.
+							parts: [{ type: "text", text: notification, synthetic: true }],
 						},
 					})
 					.then(() => "sent" as const),
@@ -951,16 +965,22 @@ class DelegationManager {
 	}
 
 	private buildTerminalNotification(delegation: DelegationRecord, remainingCount: number): string {
+		const id = escapeNotificationXml(delegation.id)
+		const status = escapeNotificationXml(delegation.status)
+		const title = escapeNotificationXml(delegation.title || delegation.id)
+		const description = delegation.description ? escapeNotificationXml(delegation.description) : ""
+		const error = delegation.error ? escapeNotificationXml(delegation.error) : ""
+		const artifact = escapeNotificationXml(delegation.artifact.filePath)
 		const lines = [
 			"<task-notification>",
-			`<task-id>${delegation.id}</task-id>`,
-			`<status>${delegation.status}</status>`,
-			`<summary>Background agent ${delegation.status}: ${delegation.title || delegation.id}</summary>`,
-			delegation.title ? `<title>${delegation.title}</title>` : "",
-			delegation.description ? `<description>${delegation.description}</description>` : "",
-			delegation.error ? `<error>${delegation.error}</error>` : "",
-			`<artifact>${delegation.artifact.filePath}</artifact>`,
-			`<retrieval>Use delegation_read("${delegation.id}") for full output.</retrieval>`,
+			`<task-id>${id}</task-id>`,
+			`<status>${status}</status>`,
+			`<summary>Background agent ${status}: ${title}</summary>`,
+			delegation.title ? `<title>${title}</title>` : "",
+			delegation.description ? `<description>${description}</description>` : "",
+			delegation.error ? `<error>${error}</error>` : "",
+			`<artifact>${artifact}</artifact>`,
+			`<retrieval>Use delegation_read("${id}") for full output.</retrieval>`,
 			remainingCount > 0 ? `<remaining>${remainingCount}</remaining>` : "",
 			"</task-notification>",
 		]
@@ -998,6 +1018,29 @@ class DelegationManager {
 		return lines.join("\n")
 	}
 
+	private buildTerminalNotificationToast(
+		delegation: DelegationRecord,
+		remainingCount: number,
+	): TuiToastOptions {
+		const status = plainNotificationText(delegation.status)
+		const title = plainNotificationText(delegation.title || delegation.id)
+		const message = [
+			`Status: ${status}`,
+			`Task ID: ${plainNotificationText(delegation.id)}`,
+			`Artifact: ${plainNotificationText(delegation.artifact.filePath)}`,
+			`Retrieve: delegation_read("${plainNotificationText(delegation.id)}")`,
+		]
+
+		if (delegation.error) message.push(`Error: ${plainNotificationText(delegation.error)}`)
+		if (remainingCount > 0) message.push(`Remaining: ${remainingCount}`)
+
+		return {
+			title: `Background agent ${status}: ${title}`,
+			message: message.join("\n"),
+			variant: status === "complete" ? "success" : status === "timeout" ? "warning" : "error",
+		}
+	}
+
 	private buildAllCompleteNotification(
 		parentSessionID: string,
 		cycle: number,
@@ -1011,9 +1054,9 @@ class DelegationManager {
 			"<type>all-complete</type>",
 			"<status>completed</status>",
 			"<summary>All delegations complete.</summary>",
-			`<parent-session-id>${parentSessionID}</parent-session-id>`,
+			`<parent-session-id>${escapeNotificationXml(parentSessionID)}</parent-session-id>`,
 			`<cycle>${cycle}</cycle>`,
-			`<cycle-token>${cycleToken}</cycle-token>`,
+			`<cycle-token>${escapeNotificationXml(cycleToken)}</cycle-token>`,
 			"</task-notification>",
 		].join("\n")
 	}
@@ -1030,6 +1073,32 @@ class DelegationManager {
 			`- **Cycle:** ${cycle}`,
 			`- **Cycle token:** ${markdownCodeSpan(cycleToken)}`,
 		].join("\n")
+	}
+
+	private buildAllCompleteNotificationToast(): TuiToastOptions {
+		return {
+			title: "Background agents",
+			message: "All delegations complete.",
+			variant: "success",
+		}
+	}
+
+	private async publishTuiToast(toast: TuiToastOptions): Promise<void> {
+		try {
+			const tui = this.client.tui
+			if (!tui || typeof tui.publish !== "function") return
+
+			await tui.publish({
+				body: {
+					type: "tui.toast.show",
+					properties: toast,
+				},
+			})
+		} catch (error) {
+			await this.debugLog(
+				`tui toast failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+			)
+		}
 	}
 
 	private buildDeterministicTerminalReadResponse(delegation: DelegationRecord): string {
@@ -1129,6 +1198,8 @@ class DelegationManager {
 
 			const remainingCount = this.getPendingCount(delegation.parentSessionID)
 			const terminalNotification = this.buildTerminalNotification(delegation, remainingCount)
+
+			await this.publishTuiToast(this.buildTerminalNotificationToast(delegation, remainingCount))
 
 			const deliveryStatus = await this.sendParentNotification(
 				delegation.parentSessionID,
@@ -2065,6 +2136,7 @@ const BackgroundAgentsPluginWithInternals = Object.assign(BackgroundAgentsPlugin
 		DelegationManager,
 		formatDelegationContext,
 		escapeNotificationText,
+		escapeNotificationXml,
 		markdownCodeSpan,
 	},
 } as const)

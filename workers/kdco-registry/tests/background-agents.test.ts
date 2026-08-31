@@ -11,13 +11,26 @@ type PromptCall = {
 	body: {
 		noReply?: boolean
 		agent?: string
-		parts?: Array<{ type: string; text?: string }>
+		parts?: Array<{ type: string; text?: string; synthetic?: boolean }>
 		tools?: Record<string, boolean>
+	}
+}
+
+type TuiToastCall = {
+	body?: {
+		type?: string
+		properties?: {
+			title?: string
+			message: string
+			variant: string
+			duration?: number
+		}
 	}
 }
 
 type MockClientState = {
 	promptCalls: PromptCall[]
+	tuiToastCalls: TuiToastCall[]
 	notificationTexts: string[]
 	messagesBySession: Map<string, string>
 	createdChildSessions: string[]
@@ -43,6 +56,7 @@ function createMockClient(options: MockClientOptions): {
 
 	const state: MockClientState = {
 		promptCalls: [],
+		tuiToastCalls: [],
 		notificationTexts: [],
 		messagesBySession: new Map(),
 		createdChildSessions: [],
@@ -83,6 +97,14 @@ function createMockClient(options: MockClientOptions): {
 		return { data: { parts: [] } }
 	}
 
+	const tui = {
+		publish(options: TuiToastCall) {
+			if (this !== tui) throw new Error("publish lost its client context")
+			state.tuiToastCalls.push(options)
+			return Promise.resolve({ data: true })
+		},
+	}
+
 	const client = {
 		app: {
 			agents: async () => ({
@@ -120,6 +142,7 @@ function createMockClient(options: MockClientOptions): {
 				},
 			}),
 		},
+		tui,
 		session: {
 			get: async ({ path: { id } }: { path: { id: string } }) => ({
 				data: {
@@ -204,9 +227,9 @@ describe("background-agents lifecycle refactor", () => {
 			rootSessionID,
 			childPromptMode: "pending",
 			onParentPrompt: async (text) => {
-				if (!text.includes("- **Task ID:** `stable-lifecycle-id`")) return
+				if (!text.includes("<task-id>stable-lifecycle-id</task-id>")) return
 
-				const artifactPathMatch = text.match(/- \*\*Artifact:\*\* `([^`]+)`/)
+				const artifactPathMatch = text.match(/<artifact>([^<]+)<\/artifact>/)
 				if (!artifactPathMatch) return
 
 				try {
@@ -255,9 +278,24 @@ describe("background-agents lifecycle refactor", () => {
 		expect(completedList.find((item) => item.id === delegation.id)?.status).toBe("complete")
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("- **Task ID:** `stable-lifecycle-id`"),
+			text.includes("<task-id>stable-lifecycle-id</task-id>"),
 		)
 		expect(terminalNotifications).toHaveLength(1)
+		expect(state.promptCalls.some((call) => call.body.parts?.[0]?.synthetic)).toBe(true)
+		expect(state.tuiToastCalls).toHaveLength(1)
+		expect(state.tuiToastCalls[0]?.body).toEqual({
+			type: "tui.toast.show",
+			properties: {
+				title: "Background agent complete: Lifecycle Result",
+				message: [
+					"Status: complete",
+					"Task ID: stable-lifecycle-id",
+					`Artifact: ${delegation.artifact.filePath}`,
+					'Retrieve: delegation_read("stable-lifecycle-id")',
+				].join("\n"),
+				variant: "success",
+			},
+		})
 	})
 
 	it("queues parent notifications when direct delivery fails and injects them into the next chat message", async () => {
@@ -429,38 +467,44 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 30)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("### All delegations complete"),
+			text.includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("- **Task ID:** `"),
+			text.includes("<task-id>"),
 		)
 		expect(terminalNotifications).toHaveLength(2)
 
 		const parentPromptCalls = state.promptCalls.filter((call) => call.sessionID === rootSessionID)
 		const terminalPromptCalls = parentPromptCalls.filter((call) =>
-			getPromptText(call).includes("- **Task ID:** `"),
+			getPromptText(call).includes("<task-id>"),
 		)
 		expect(terminalPromptCalls).toHaveLength(2)
 		const terminalPromptIndices = parentPromptCalls
 			.map((call, index) => ({ call, index }))
-			.filter(({ call }) => getPromptText(call).includes("- **Task ID:** `"))
+			.filter(({ call }) => getPromptText(call).includes("<task-id>"))
 			.map(({ index }) => index)
 		expect(terminalPromptIndices).toHaveLength(2)
 		for (const call of terminalPromptCalls) {
 			expect(call.body.noReply).toBe(true)
+			expect(call.body.parts?.[0]?.synthetic).toBe(true)
 		}
 
 		const allCompletePromptCalls = parentPromptCalls.filter((call) =>
-			getPromptText(call).includes("### All delegations complete"),
+			getPromptText(call).includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompletePromptCalls).toHaveLength(1)
 		expect(allCompletePromptCalls[0]?.body.noReply).toBe(false)
+		expect(allCompletePromptCalls[0]?.body.parts?.[0]?.synthetic).toBe(true)
 		const allCompletePromptIndex = parentPromptCalls.findIndex((call) =>
-			getPromptText(call).includes("### All delegations complete"),
+			getPromptText(call).includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompletePromptIndex).toBeGreaterThan(Math.max(...terminalPromptIndices))
+		expect(state.tuiToastCalls).toHaveLength(3)
+		expect(
+			state.tuiToastCalls.filter((call) => call.body?.properties?.title === "Background agents"),
+		).toHaveLength(1)
 	})
 
 	it("finalizes completed child prompts even when session.idle is not delivered", async () => {
@@ -517,14 +561,14 @@ describe("background-agents lifecycle refactor", () => {
 		expect(completedList.find((item) => item.id === second.id)?.status).toBe("complete")
 
 		const terminalNotifications = state.notificationTexts.filter((text) =>
-			text.includes("- **Task ID:** `"),
+			text.includes("<task-id>"),
 		)
 		expect(terminalNotifications).toHaveLength(2)
 		expect(terminalNotifications.some((text) => text.includes(first.id))).toBe(true)
 		expect(terminalNotifications.some((text) => text.includes(second.id))).toBe(true)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("### All delegations complete"),
+			text.includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
 	})
@@ -569,7 +613,7 @@ describe("background-agents lifecycle refactor", () => {
 		await manager.handleSessionIdle(batchADelegation.sessionID)
 
 		const allCompleteAfterBatchAFinalize = state.notificationTexts.filter((text) =>
-			text.includes("### All delegations complete"),
+			text.includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompleteAfterBatchAFinalize).toHaveLength(0)
 
@@ -596,7 +640,7 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 40)
 
 		const allCompleteBeforeBatchBFinalize = state.notificationTexts.filter((text) =>
-			text.includes("### All delegations complete"),
+			text.includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompleteBeforeBatchBFinalize).toHaveLength(0)
 
@@ -607,22 +651,22 @@ describe("background-agents lifecycle refactor", () => {
 		await sleep(allCompleteQuietPeriodMs + 40)
 
 		const allCompleteNotifications = state.notificationTexts.filter((text) =>
-			text.includes("### All delegations complete"),
+			text.includes("<summary>All delegations complete.</summary>"),
 		)
 		expect(allCompleteNotifications).toHaveLength(1)
-		expect(allCompleteNotifications[0]).toContain("- **Cycle:** 2")
+		expect(allCompleteNotifications[0]).toContain("<cycle>2</cycle>")
 		expect(allCompleteNotifications[0]).toContain(
-			`- **Cycle token:** \`${batchBDelegation.notificationCycleToken}\``,
+			`<cycle-token>${batchBDelegation.notificationCycleToken}</cycle-token>`,
 		)
 		expect(allCompleteNotifications[0]).not.toContain(
-			`- **Cycle token:** \`${batchADelegation.notificationCycleToken}\``,
+			`<cycle-token>${batchADelegation.notificationCycleToken}</cycle-token>`,
 		)
 
 		const notificationsAfterBatchBStart = state.notificationTexts
 			.slice(notificationCountAtBatchBStart)
-			.filter((text) => text.includes("### All delegations complete"))
+			.filter((text) => text.includes("<summary>All delegations complete.</summary>"))
 		expect(notificationsAfterBatchBStart).toHaveLength(1)
-		expect(notificationsAfterBatchBStart[0]).toContain("- **Cycle:** 2")
+		expect(notificationsAfterBatchBStart[0]).toContain("<cycle>2</cycle>")
 	})
 
 	it("preserves unread carry-forward when delegation_read returns terminal fallback first", async () => {
@@ -774,7 +818,8 @@ describe("background-agents lifecycle refactor", () => {
 })
 
 describe("notification text escaping", () => {
-	const { escapeNotificationText, markdownCodeSpan } = BackgroundAgentsPlugin.testInternals
+	const { escapeNotificationText, escapeNotificationXml, markdownCodeSpan } =
+		BackgroundAgentsPlugin.testInternals
 
 	it("escapes Markdown control characters so a generated title cannot restructure the notification", () => {
 		const escaped = escapeNotificationText("[click me](https://evil.example) and **bold**")
@@ -792,6 +837,16 @@ describe("notification text escaping", () => {
 	it("collapses newlines to spaces", () => {
 		expect(escapeNotificationText("line one\nline two\r\nline three")).toBe(
 			"line one line two line three",
+		)
+	})
+
+	it("escapes Markdown strikethrough markers", () => {
+		expect(escapeNotificationText("~~struck~~")).toBe("\\~\\~struck\\~\\~")
+	})
+
+	it("escapes XML text before sending it to the model", () => {
+		expect(escapeNotificationXml("<title>A & B</title>")).toBe(
+			"&lt;title&gt;A &amp; B&lt;/title&gt;",
 		)
 	})
 
