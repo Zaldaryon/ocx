@@ -794,7 +794,7 @@ class DelegationManager {
 		if (!this.areCycleTerminalNotificationsComplete(parentSessionID, cycleToken)) return
 		if (state.allCompleteNotifiedCycleToken === cycleToken) return
 
-		await this.publishTuiToast(this.buildAllCompleteNotificationToast())
+		const tuiToastDelivered = await this.publishTuiToast(this.buildAllCompleteNotificationToast())
 
 		const deliveryStatus = await this.sendParentNotification(
 			parentSessionID,
@@ -802,6 +802,7 @@ class DelegationManager {
 			this.buildAllCompleteNotification(parentSessionID, cycle, cycleToken),
 			false,
 			this.buildAllCompleteNotificationDisplay(parentSessionID, cycle, cycleToken),
+			tuiToastDelivered,
 		)
 
 		if (state.allCompleteCycleToken !== cycleToken) return
@@ -829,6 +830,7 @@ class DelegationManager {
 		notification: string,
 		noReply: boolean,
 		displayText: string = notification,
+		tuiToastDelivered = true,
 	): Promise<"sent" | "queued" | "timed-out"> {
 		const session = this.client.session
 		let timeout: ReturnType<typeof setTimeout> | undefined
@@ -847,9 +849,11 @@ class DelegationManager {
 						body: {
 							noReply,
 							agent: parentAgent,
-							// Keep the machine-readable notification in model context without
-							// exposing Markdown as a literal user message in the TUI.
-							parts: [{ type: "text", text: notification, synthetic: true }],
+							parts: [
+								tuiToastDelivered
+									? { type: "text", text: notification, synthetic: true }
+									: { type: "text", text: displayText },
+							],
 						},
 					})
 					.then(() => "sent" as const),
@@ -1037,7 +1041,14 @@ class DelegationManager {
 		return {
 			title: `Background agent ${status}: ${title}`,
 			message: message.join("\n"),
-variant: status === "complete" ? "success" : status === "cancelled" ? "info" : status === "timeout" ? "warning" : "error",
+			variant:
+				status === "complete"
+					? "success"
+					: status === "cancelled"
+						? "info"
+						: status === "timeout"
+							? "warning"
+							: "error",
 		}
 	}
 
@@ -1083,10 +1094,10 @@ variant: status === "complete" ? "success" : status === "cancelled" ? "info" : s
 		}
 	}
 
-	private async publishTuiToast(toast: TuiToastOptions): Promise<void> {
+	private async publishTuiToast(toast: TuiToastOptions): Promise<boolean> {
 		try {
 			const tui = this.client.tui
-			if (!tui || typeof tui.publish !== "function") return
+			if (!tui || typeof tui.publish !== "function") return false
 
 			await tui.publish({
 				body: {
@@ -1094,10 +1105,12 @@ variant: status === "complete" ? "success" : status === "cancelled" ? "info" : s
 					properties: toast,
 				},
 			})
+			return true
 		} catch (error) {
 			await this.debugLog(
 				`tui toast failed: ${error instanceof Error ? error.message : "Unknown error"}`,
 			)
+			return false
 		}
 	}
 
@@ -1199,7 +1212,9 @@ variant: status === "complete" ? "success" : status === "cancelled" ? "info" : s
 			const remainingCount = this.getPendingCount(delegation.parentSessionID)
 			const terminalNotification = this.buildTerminalNotification(delegation, remainingCount)
 
-			await this.publishTuiToast(this.buildTerminalNotificationToast(delegation, remainingCount))
+			const tuiToastDelivered = await this.publishTuiToast(
+				this.buildTerminalNotificationToast(delegation, remainingCount),
+			)
 
 			const deliveryStatus = await this.sendParentNotification(
 				delegation.parentSessionID,
@@ -1207,6 +1222,7 @@ variant: status === "complete" ? "success" : status === "cancelled" ? "info" : s
 				terminalNotification,
 				true,
 				this.buildTerminalNotificationDisplay(delegation, remainingCount),
+				tuiToastDelivered,
 			)
 
 			this.markNotified(delegation.id)
