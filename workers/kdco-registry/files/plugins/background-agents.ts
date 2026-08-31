@@ -1037,7 +1037,7 @@ class DelegationManager {
 		return {
 			title: `Background agent ${status}: ${title}`,
 			message: message.join("\n"),
-			variant: status === "complete" ? "success" : status === "timeout" ? "warning" : "error",
+variant: status === "complete" ? "success" : status === "cancelled" ? "info" : status === "timeout" ? "warning" : "error",
 		}
 	}
 
